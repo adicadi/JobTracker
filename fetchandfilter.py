@@ -1,8 +1,8 @@
 import os
 import base64
-import pandas as pd
 import json
-import re
+import pandas as pd
+import joblib
 import nltk
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -10,155 +10,167 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from nltk.corpus import stopwords
-import ssl
-
-try:
-    _create_unverified_https_context = ssl._create_unverified_context
-    ssl._create_default_https_context = _create_unverified_https_context
-except AttributeError:
-    pass
 
 # Download stopwords for NLP processing
 nltk.download('stopwords')
 
-# Define the scope (read-only access to Gmail)
+# Gmail API Scope
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
-# German and English Job-Related Keywords
-JOB_KEYWORDS = [
-    "job application", "interview", "hiring", "recruiter", "career opportunity", "resume", "CV", "HR",
-    "internship", "shortlisted", "final round", "work student", "mandatory internship", "recruitment", 
-    "job position", "open position", "career", "job offer", "apply now", "candidate",
-    "bewerbung", "bewerbungsunterlagen", "lebenslauf", "vorstellungsgespräch", "bewerbungsgespräch",
-    "praktikum", "werkstudent", "jobangebot", "karriere", "personalabteilung", "stellenausschreibung",
-    "bewerbungsprozess", "jobchance", "jobportal", "einstellungsprozess", "neue karrierechance"
-]
+# Paths for AI model and training data
+MODEL_PATH = "job_email_classifier.pkl"
+TRAINING_DATA_PATH = "training_data.csv"
 
-# Load Exclude List from Config File
-def load_exclusion_lists():
-    """Load excluded senders and keywords dynamically from config.json"""
-    with open("config.json", "r", encoding="utf-8") as f:
-        config = json.load(f)
-    return config["exclude_senders"], config["exclude_keywords"]
+# Train AI Model Using Real Data
+def train_email_classifier():
+    """Retrain AI model using balanced job & spam emails."""
+    
+    if not os.path.exists(TRAINING_DATA_PATH):
+        print("⚠️ No real training data found! Using default dataset.")
+        return
 
-# Use the dynamic lists in filtering
-EXCLUDE_SENDERS, EXCLUDE_KEYWORDS = load_exclusion_lists()
+    df = pd.read_csv(TRAINING_DATA_PATH)
 
+    # Balance dataset (equal job & spam emails)
+    job_emails = df[df["label"] == "job"]
+    spam_emails = df[df["label"] == "spam"]
+    
+    num_jobs = len(job_emails)
+    if num_jobs == 0 or len(spam_emails) == 0:
+        print("❌ Error: Training data must have both 'job' and 'spam' categories.")
+        return
+    
+    spam_sample = spam_emails.sample(n=min(num_jobs, len(spam_emails)), random_state=42)
+    df_balanced = pd.concat([job_emails, spam_sample]).sample(frac=1, random_state=42)
+
+    # Prepare training data
+    training_texts = (df_balanced["subject"] + " " + df_balanced["sender"]).tolist()
+    training_labels = [1 if label == "job" else 0 for label in df_balanced["label"]]
+
+    vectorizer = TfidfVectorizer()
+    X_train = vectorizer.fit_transform(training_texts)
+
+    model = LogisticRegression(max_iter=500)
+    model.fit(X_train, training_labels)
+
+    # Save trained model
+    joblib.dump((model, vectorizer), MODEL_PATH)
+    print(f"✅ AI Model Retrained with {num_jobs} Job Emails & {num_jobs} Spam Emails (Balanced).")
+
+# Authenticate Gmail API
 def authenticate_gmail():
     """Authenticate and connect to Gmail API."""
     creds = None
-
-    # Load existing token or authenticate
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-    
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
-        
-        # Save the access token for next time
+
         with open("token.json", "w") as token:
             token.write(creds.to_json())
 
     return creds
 
-def fetch_emails():
-    """Fetches emails from Gmail API."""
+# Fetch Emails from Gmail "Jobs" Label
+def fetch_jobs_label_emails():
+    """Fetch all emails from Gmail 'Jobs' label and include sender details."""
+    
     creds = authenticate_gmail()
     service = build("gmail", "v1", credentials=creds)
-
-    # Get the user's inbox messages (fetching latest 30 emails)
-    results = service.users().messages().list(userId="me", maxResults=30).execute()
+    query = "label:Jobs"
+    results = service.users().messages().list(userId="me", q=query, maxResults=200).execute()
     messages = results.get("messages", [])
 
-    emails = []
-
+    job_emails = []
     for msg in messages:
         msg_id = msg["id"]
         email = service.users().messages().get(userId="me", id=msg_id).execute()
+        headers = email["payload"]["headers"]
 
-        payload = email["payload"]
-        headers = payload["headers"]
-
-        # Extract subject and sender
         subject = next((h["value"] for h in headers if h["name"] == "Subject"), "No Subject")
         sender = next((h["value"] for h in headers if h["name"] == "From"), "Unknown Sender")
 
-        # Extract email body
-        body = ""
-        if "parts" in payload:
-            for part in payload["parts"]:
-                if part["mimeType"] == "text/plain":
-                    body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8")
-                    break
-        else:
-            body = "No body available"
+        job_emails.append({"subject": subject, "sender": sender, "label": "job"})
 
-        emails.append({"sender": sender, "subject": subject, "body": body})
+    return job_emails
 
-    return emails
-
-def classify_emails(emails):
-    """Classifies emails as job-related or not using Logistic Regression model."""
-
-    # Sample training data (job-related vs. non-job emails)
-    training_texts = [
-        "Job application received for software engineer",
-        "Your interview has been scheduled",
-        "Hiring for a new data scientist role",
-        "Apply now for an open internship position",
-        "We are interested in your resume",
-        "Discount on your favorite shoes!",
-        "Your flight ticket booking is confirmed",
-        "Newsletter: The latest fashion trends",
-        "Exclusive offer: 30% off on electronics",
-        "Reminder: Your gym membership renewal is due"
-    ]
+# Fetch Spam Emails
+def fetch_spam_emails():
+    """Fetch spam emails from Gmail categories (Social, Forums, Promotions)."""
     
-    training_labels = [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]  # 1 = Job-related, 0 = Not job-related
+    creds = authenticate_gmail()
+    service = build("gmail", "v1", credentials=creds)
+    categories = {"category:social": "Social", "category:forums": "Forums", "category:promotions": "Promotions"}
 
-    # Vectorization with stopword removal (English & German)
-    stop_words = stopwords.words('english') + stopwords.words('german')
-    vectorizer = TfidfVectorizer(stop_words=stop_words)
-    X_train = vectorizer.fit_transform(training_texts)
+    spam_emails = []
+    for category, label in categories.items():
+        print(f"\n📩 Fetching {label} emails...")
+        results = service.users().messages().list(userId="me", q=category, maxResults=100).execute()
+        messages = results.get("messages", [])
 
-    # Train Logistic Regression model
-    model = LogisticRegression()
-    model.fit(X_train, training_labels)
+        for msg in messages:
+            msg_id = msg["id"]
+            email = service.users().messages().get(userId="me", id=msg_id).execute()
+            headers = email["payload"]["headers"]
 
-    # Classify new emails
+            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "No Subject")
+            sender = next((h["value"] for h in headers if h["name"] == "From"), "Unknown Sender")
+
+            spam_emails.append({"subject": subject, "sender": sender, "label": "spam"})
+
+    return spam_emails
+
+# Classify Emails Using AI
+def classify_emails_with_ml(emails):
+    """Classify emails using AI with subject and sender information."""
+
+    model, vectorizer = joblib.load(MODEL_PATH)
     job_emails = []
-    email_texts = [email["subject"] + " " + email["body"] for email in emails]
-    X_test = vectorizer.transform(email_texts)
-    predictions = model.predict(X_test)
+    spam_keywords = ["instagram", "linkedin messaging", "duolingo", "facebook", "snapchat", "newsletter", "promotion"]
+    job_domains = ["smartrecruiters.com", "successfactors.eu", "bosch.com", "dlr.de", "softgarden.io"]
 
-    for i, email in enumerate(emails):
-        if predictions[i] == 1 and not any(kw in email["subject"].lower() for kw in EXCLUDE_KEYWORDS):
+    for email in emails:
+        subject_lower = email["subject"].lower()
+        sender_lower = email["sender"].lower()
+
+        if any(domain in sender_lower for domain in job_domains):
+            print(f"✅ Keeping (Known Job Domain): {email['subject']} from {email['sender']}")
+            job_emails.append(email)
+            continue
+
+        if any(kw in subject_lower for kw in spam_keywords) or any(kw in sender_lower for kw in spam_keywords):
+            print(f"🛑 Skipping (Detected as Social Media/Spam): {email['subject']} from {email['sender']}")
+            continue
+
+        email_text = email["subject"] + " " + email["sender"]
+        X_test = vectorizer.transform([email_text])
+        prediction = model.predict(X_test)[0]
+
+        if prediction == 1:
             job_emails.append(email)
 
     return job_emails
 
-def save_to_csv(job_emails):
-    """Saves filtered job emails to a CSV file."""
-    df = pd.DataFrame(job_emails)
-    df.to_csv("filtered_job_emails.csv", index=False)
-    print("\n✅ Filtered job emails saved to 'filtered_job_emails.csv'!")
-
 # Run the script
 if __name__ == "__main__":
-    print("\n📩 Fetching emails...")
-    emails = fetch_emails()
+    print("\n📩 Fetching job & spam emails and updating training data...")
+    job_emails = fetch_jobs_label_emails()
+    spam_emails = fetch_spam_emails()
+    
+    df_existing = pd.DataFrame(columns=["subject", "sender", "label"])
+    df_combined = pd.concat([df_existing, pd.DataFrame(job_emails), pd.DataFrame(spam_emails)]).drop_duplicates()
+    df_combined.to_csv(TRAINING_DATA_PATH, index=False)
 
-    print("\n🔍 Filtering job-related emails...")
-    job_emails = classify_emails(emails)
+    train_email_classifier()
+    print("\n📩 Fetching new emails...")
+    emails = fetch_jobs_label_emails()
+    print("\n🔍 Filtering job-related emails using AI...")
+    job_emails = classify_emails_with_ml(emails)
 
-    if job_emails:
-        for mail in job_emails:
-            print(f"\n📧 {mail['subject']} - {mail['sender']}")
-        save_to_csv(job_emails)
-    else:
-        print("\n✅ No job-related emails found!")
+    pd.DataFrame(job_emails).to_csv("filtered_job_emails.csv", index=False)
+    print("\n✅ Filtered job emails saved to 'filtered_job_emails.csv'!")
